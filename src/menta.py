@@ -6,6 +6,7 @@ Commands:
   run   -> records the stream around the current slot, transcribes, extracts the
            word, submits the Google Form, sends Telegram alerts
   test  -> 30s recording + transcription + form-mapping check (nothing submitted)
+  window -> records 60s before through 60s after the next scheduled announcement
 """
 import json
 import os
@@ -61,6 +62,49 @@ def current_slot(t=None):
         for h in SLOT_HOURS:
             cands.append(datetime(day.year, day.month, day.day, h, tzinfo=TZ))
     return min(cands, key=lambda s: abs((s - t).total_seconds()))
+
+
+
+def next_slot_within(minutes=15):
+    """Return the next scheduled Athens slot if it is within `minutes`."""
+    t = now()
+    candidates = []
+    for d in (0, 1):
+        day = (t + timedelta(days=d)).date()
+        for h in SLOT_HOURS:
+            slot = datetime(day.year, day.month, day.day, h, 0, 0, tzinfo=TZ)
+            if slot > t:
+                candidates.append(slot)
+    if not candidates:
+        return None
+    slot = min(candidates)
+    delta = (slot - t).total_seconds()
+    return slot if 0 < delta <= minutes * 60 else None
+
+
+def iso_ms(dt):
+    return dt.isoformat(timespec="milliseconds")
+
+
+def telegram_window_result(message, audio_path):
+    """Send result text and the complete MP3 as a Telegram audio attachment."""
+    tg(message)
+    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return
+    if not Path(audio_path).exists():
+        return
+    try:
+        import requests
+        with open(audio_path, "rb") as f:
+            r = requests.post(
+                f"https://api.telegram.org/bot{token}/sendAudio",
+                data={"chat_id": chat, "title": Path(audio_path).name,
+                      "caption": "Complete 2-minute recording (Athens time)."},
+                files={"audio": f}, timeout=120)
+        r.raise_for_status()
+    except Exception as e:
+        log("Telegram audio upload failed:", e)
 
 
 def slot_id(s):
@@ -309,6 +353,97 @@ def cmd_run():
         sys.exit(1)
 
 
+def cmd_window():
+    """Record exactly the minute before and minute after the next slot."""
+    slot = next_slot_within(int(os.environ.get("WINDOW_LOOKAHEAD_MINUTES", "15")))
+    if slot is None:
+        log("No announcement slot within the look-ahead window; skipping this run.")
+        return
+
+    start_target = slot - timedelta(minutes=1)
+    end_target = slot + timedelta(minutes=1)
+    wait_seconds = (start_target - now()).total_seconds()
+    if wait_seconds > 0:
+        log(f"Next slot {slot.isoformat()} — waiting {wait_seconds:.3f}s until recording start.")
+        time.sleep(wait_seconds)
+
+    sid = slot.strftime("%Y-%m-%d_%H-%M")
+    outdir = REC / sid
+    outdir.mkdir(parents=True, exist_ok=True)
+    audio_path = outdir / f"menta_{sid}.mp3"
+    metadata_path = outdir / f"menta_{sid}.json"
+
+    scheduled_start = start_target
+    scheduled_end = end_target
+    actual_start = now()
+    mono_start = time.monotonic()
+    duration_seconds = 120
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+        "-user_agent", UA,
+        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+        "-i", STREAM_URL, "-t", str(duration_seconds), "-vn",
+        "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "64k",
+        str(audio_path),
+    ]
+    log("Starting 120-second announcement recording:", audio_path)
+    proc = subprocess.Popen(cmd)
+    rc = proc.wait()
+    mono_end = time.monotonic()
+    actual_end = now()
+    actual_duration = mono_end - mono_start
+
+    if rc != 0 or not audio_path.exists() or audio_path.stat().st_size == 0:
+        details = {"slot": slot.isoformat(), "ffmpeg_return_code": rc,
+                   "actual_start": iso_ms(actual_start), "actual_end": iso_ms(actual_end)}
+        metadata_path.write_text(json.dumps(details, ensure_ascii=False, indent=2))
+        tg(f"❌ Recording failed for {slot:%H:%M} Athens. FFmpeg exit code: {rc}.")
+        sys.exit(1)
+
+    log("Transcribing", audio_path)
+    transcript = transcribe(audio_path)
+    word = extract_word(transcript)
+    metadata = {
+        "scheduled_announcement_at_athens": slot.isoformat(timespec="seconds"),
+        "scheduled_recording_start_athens": iso_ms(scheduled_start),
+        "scheduled_recording_end_athens": iso_ms(scheduled_end),
+        "actual_recording_start_athens": iso_ms(actual_start),
+        "actual_recording_end_athens": iso_ms(actual_end),
+        "actual_recording_start_utc": actual_start.astimezone(ZoneInfo("UTC")).isoformat(timespec="milliseconds"),
+        "actual_recording_end_utc": actual_end.astimezone(ZoneInfo("UTC")).isoformat(timespec="milliseconds"),
+        "actual_duration_seconds_monotonic": round(actual_duration, 3),
+        "start_offset_from_schedule_seconds": round((actual_start - scheduled_start).total_seconds(), 3),
+        "end_offset_from_schedule_seconds": round((actual_end - scheduled_end).total_seconds(), 3),
+        "stream_url": STREAM_URL.split("?")[0],
+        "audio_file": audio_path.name,
+        "transcribed_at_athens": iso_ms(now()),
+        "language": "el",
+        "transcript": transcript,
+        "detected_word": word,
+        "ffmpeg_exit_code": rc,
+        "note": "Actual timestamps mark the local FFmpeg process start/end; they do not prove the exact broadcast transmission time because stream buffering may add delay."
+    }
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2))
+
+    word_line = f"\n🎯 DETECTED WORD: {word}" if word else "\n⚠️ No competition word confidently extracted."
+    message = (
+        f"🎙 MENTA 88 — {slot:%H:%M} announcement (Europe/Athens)\n\n"
+        f"📅 Date: {slot:%d %B %Y}\n"
+        f"⏰ Scheduled recording: {scheduled_start:%H:%M:%S}–{scheduled_end:%H:%M:%S}\n"
+        f"🔴 Actual recording start: {actual_start:%H:%M:%S.%f}\n"
+        f"⏹ Actual recording end: {actual_end:%H:%M:%S.%f}\n"
+        f"⏱ Actual duration: {actual_duration:.3f} seconds\n"
+        f"📏 Start offset: {(actual_start - scheduled_start).total_seconds():+.3f}s\n\n"
+        f"📝 TRANSCRIPTION\n{transcript or '[No speech detected]'}"
+        f"{word_line}\n\n"
+        f"📎 Audio: {audio_path.name}\n"
+        f"🗂 Timestamp metadata: {metadata_path.name}\n"
+        "ℹ️ Recording timestamps are server capture times; stream buffering may mean the presenter spoke earlier."
+    )
+    telegram_window_result(message, audio_path)
+    log("Saved metadata:", metadata_path)
+
+
 def cmd_test():
     out = REC / "test"
     shutil.rmtree(out, ignore_errors=True)
@@ -335,4 +470,4 @@ def cmd_test():
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
-    {"gate": cmd_gate, "run": cmd_run, "test": cmd_test}[cmd]()
+    {"gate": cmd_gate, "run": cmd_run, "test": cmd_test, "window": cmd_window}[cmd]()

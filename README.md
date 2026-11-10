@@ -11,11 +11,13 @@ Every run uploads timestamped MP3 chunks + JSON transcripts as a downloadable ar
 3. Repo -> Settings -> Secrets and variables -> Actions -> **Secrets**:
    `EMAIL, SURNAME, FIRST_NAME, GENDER (MALE/FEMALE/OTHER), AGE, PHONE, AREA, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID`
    (the form is in Greek, so e.g. SURNAME=ΓΙΑΝΝΙΟΣ, FIRST_NAME=ΓΙΩΡΓΟΣ, AREA=ΒΟΛΟΣ is a good idea).
-4. Actions tab -> **Test stream (manual)** -> Run workflow. Check Telegram + the artifact:
-   audio recorded? Greek transcript sensible? "Form mapping OK"?
-5. The contest workflow runs on schedule in **DRY_RUN** mode (nothing submitted, you just get alerts).
-6. After you've read the contest rules and are happy with accuracy:
-   Settings -> Variables -> New variable `DRY_RUN` = `false`.
+4. Actions tab -> **Menta 88 - announcement recording** -> Run workflow to test. This records around the next announcement only if it is within 15 minutes. Check Telegram and download the artifact.
+5. The scheduled workflow checks hourly and records a two-minute window (one minute before through one minute after) when the next 08:00/10:00/12:00/14:00/16:00/18:00/20:00 Athens announcement is near. It sends the MP3 and full Greek transcription to Telegram.
+6. Add only these two repository secrets for this recording workflow: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`. The older form-submission workflow may need the personal-information secrets listed below.
+7. This recording workflow does not submit the Google Form.
+
+## Recording timestamps
+Each recording folder contains an MP3 and a JSON file. The JSON stores the scheduled announcement time, scheduled and actual recording start/end times in Athens, UTC start/end, monotonic measured duration, start/end offsets, transcript, and extracted candidate word. Actual timestamps refer to the GitHub runner capturing the stream; they are not proof of the presenter's exact transmission time because internet-radio buffering can introduce delay. GitHub Actions scheduled jobs can also start late, so inspect the recorded start offset in Telegram/JSON.
 
 ## Tuning (repo Variables)
 - `WHISPER_MODEL`: `small` (default) or `medium` (more accurate for Greek, slower).
