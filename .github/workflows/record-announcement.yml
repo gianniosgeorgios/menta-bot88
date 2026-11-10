@@ -1,0 +1,54 @@
+name: Menta 88 - announcement recording
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Check hourly; Python proceeds only when an announcement is within 15 minutes.
+    # GitHub Actions cron uses UTC. Python handles Europe/Athens and DST.
+    - cron: '50 4-18 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: menta-announcement-recording
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Record, transcribe, and notify
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WHISPER_MODEL: small
+          WINDOW_LOOKAHEAD_MINUTES: '15'
+        run: python src/menta.py window
+
+      - name: Upload MP3 and timestamp metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: menta-recordings-${{ github.run_id }}
+          path: recordings/
+          retention-days: 14
+          if-no-files-found: warn
