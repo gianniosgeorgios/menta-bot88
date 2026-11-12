@@ -286,7 +286,7 @@ def cmd_gate():
             f.write(line)
 
 
-def watch(sid, seconds):
+def watch(sid, seconds, confirmations=None):
     outdir = REC / sid
     stamp = now().strftime("%Y-%m-%d_%H-%M-%S")
     t0 = time.time()
@@ -313,7 +313,7 @@ def watch(sid, seconds):
                 e["n"] += 1
                 if e["n"] == 1:
                     tg(f"👂 Heard candidate word: {word}\n\"{text}\"", audio=str(win))
-                if e["n"] >= CONFIRMATIONS:
+                if e["n"] >= (confirmations or CONFIRMATIONS):
                     proc.terminate()
                     return e
             prev = cur
@@ -354,94 +354,77 @@ def cmd_run():
 
 
 def cmd_window():
-    """Record exactly the minute before and minute after the next slot."""
-    slot = next_slot_within(int(os.environ.get("WINDOW_LOOKAHEAD_MINUTES", "15")))
-    if slot is None:
-        log("No announcement slot within the look-ahead window; skipping this run.")
+    """Listen around the nearest announcement slot (works even if the run starts late).
+
+    Records in short chunks, transcribes while recording, and sends a Telegram alert
+    (text + audio clip) the moment a candidate word is heard. Nothing is submitted.
+    """
+    env = os.environ
+    lookahead = int(env.get("WINDOW_LOOKAHEAD_MINUTES", "15")) * 60
+    before = int(env.get("WINDOW_BEFORE_SECONDS", "60"))
+    after = int(env.get("WINDOW_AFTER_SECONDS", "300"))
+
+    t = now()
+    slot = current_slot(t)
+    delta = (t - slot).total_seconds()          # negative = slot still ahead
+    if not (-lookahead <= delta <= after - 30):
+        log(f"No slot in range (nearest {slot:%H:%M}, delta {delta:.0f}s) - skipping.")
         return
 
-    start_target = slot - timedelta(minutes=1)
-    end_target = slot + timedelta(minutes=1)
-    wait_seconds = (start_target - now()).total_seconds()
-    if wait_seconds > 0:
-        log(f"Next slot {slot.isoformat()} — waiting {wait_seconds:.3f}s until recording start.")
-        time.sleep(wait_seconds)
+    get_model()                                  # preload while we wait
+    start_target = slot - timedelta(seconds=before)
+    end_target = slot + timedelta(seconds=after)
+    wait = (start_target - now()).total_seconds()
+    if wait > 0:
+        log(f"Slot {slot:%H:%M}: waiting {wait:.1f}s until recording start.")
+        time.sleep(wait)
+
+    seconds = int((end_target - now()).total_seconds())
+    if seconds < 30:
+        tg(f"⚠️ {slot:%H:%M} run started too late - skipped.")
+        return
 
     sid = slot.strftime("%Y-%m-%d_%H-%M")
     outdir = REC / sid
-    outdir.mkdir(parents=True, exist_ok=True)
-    audio_path = outdir / f"menta_{sid}.mp3"
-    metadata_path = outdir / f"menta_{sid}.json"
-
-    scheduled_start = start_target
-    scheduled_end = end_target
     actual_start = now()
-    mono_start = time.monotonic()
-    duration_seconds = 120
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
-        "-user_agent", UA,
-        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-        "-i", STREAM_URL, "-t", str(duration_seconds), "-vn",
-        "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "64k",
-        str(audio_path),
-    ]
-    log("Starting 120-second announcement recording:", audio_path)
-    proc = subprocess.Popen(cmd)
-    rc = proc.wait()
-    mono_end = time.monotonic()
-    actual_end = now()
-    actual_duration = mono_end - mono_start
-
-    if rc != 0 or not audio_path.exists() or audio_path.stat().st_size == 0:
-        details = {"slot": slot.isoformat(), "ffmpeg_return_code": rc,
-                   "actual_start": iso_ms(actual_start), "actual_end": iso_ms(actual_end)}
-        metadata_path.write_text(json.dumps(details, ensure_ascii=False, indent=2))
-        tg(f"❌ Recording failed for {slot:%H:%M} Athens. FFmpeg exit code: {rc}.")
+    start_offset = (actual_start - start_target).total_seconds()
+    tg(f"🎙 Listening for the {slot:%H:%M} announcement until {end_target:%H:%M:%S} "
+       f"({seconds}s, start offset {start_offset:+.0f}s)")
+    try:
+        res = watch(sid, seconds, confirmations=10**6)   # never stop early; alert on each new candidate
+    except Exception as e:
+        tg(f"❌ {slot:%H:%M} recording failed: {e}")
         sys.exit(1)
+    actual_end = now()
 
-    log("Transcribing", audio_path)
-    transcript = transcribe(audio_path)
-    word = extract_word(transcript)
+    parts = []
+    for p in sorted(outdir.glob("*_chunk*.json")):
+        try:
+            parts.append(json.loads(p.read_text()))
+        except Exception:
+            pass
+    transcript = " ".join(x.get("transcript", "") for x in parts)
+    word = res["word"] if res else None
     metadata = {
-        "scheduled_announcement_at_athens": slot.isoformat(timespec="seconds"),
-        "scheduled_recording_start_athens": iso_ms(scheduled_start),
-        "scheduled_recording_end_athens": iso_ms(scheduled_end),
-        "actual_recording_start_athens": iso_ms(actual_start),
-        "actual_recording_end_athens": iso_ms(actual_end),
-        "actual_recording_start_utc": actual_start.astimezone(ZoneInfo("UTC")).isoformat(timespec="milliseconds"),
-        "actual_recording_end_utc": actual_end.astimezone(ZoneInfo("UTC")).isoformat(timespec="milliseconds"),
-        "actual_duration_seconds_monotonic": round(actual_duration, 3),
-        "start_offset_from_schedule_seconds": round((actual_start - scheduled_start).total_seconds(), 3),
-        "end_offset_from_schedule_seconds": round((actual_end - scheduled_end).total_seconds(), 3),
+        "announcement_slot_athens": slot.isoformat(timespec="seconds"),
+        "scheduled_start_athens": iso_ms(start_target),
+        "scheduled_end_athens": iso_ms(end_target),
+        "actual_start_athens": iso_ms(actual_start),
+        "actual_end_athens": iso_ms(actual_end),
+        "actual_start_utc": actual_start.astimezone(ZoneInfo("UTC")).isoformat(timespec="milliseconds"),
+        "actual_end_utc": actual_end.astimezone(ZoneInfo("UTC")).isoformat(timespec="milliseconds"),
+        "start_offset_from_schedule_seconds": round(start_offset, 3),
         "stream_url": STREAM_URL.split("?")[0],
-        "audio_file": audio_path.name,
-        "transcribed_at_athens": iso_ms(now()),
-        "language": "el",
-        "transcript": transcript,
+        "chunk_seconds": CHUNK,
         "detected_word": word,
-        "ffmpeg_exit_code": rc,
-        "note": "Actual timestamps mark the local FFmpeg process start/end; they do not prove the exact broadcast transmission time because stream buffering may add delay."
+        "chunks": parts,
+        "note": "Timestamps are runner capture times; stream buffering may add delay vs. real broadcast.",
     }
-    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2))
-
-    word_line = f"\n🎯 DETECTED WORD: {word}" if word else "\n⚠️ No competition word confidently extracted."
-    message = (
-        f"🎙 MENTA 88 — {slot:%H:%M} announcement (Europe/Athens)\n\n"
-        f"📅 Date: {slot:%d %B %Y}\n"
-        f"⏰ Scheduled recording: {scheduled_start:%H:%M:%S}–{scheduled_end:%H:%M:%S}\n"
-        f"🔴 Actual recording start: {actual_start:%H:%M:%S.%f}\n"
-        f"⏹ Actual recording end: {actual_end:%H:%M:%S.%f}\n"
-        f"⏱ Actual duration: {actual_duration:.3f} seconds\n"
-        f"📏 Start offset: {(actual_start - scheduled_start).total_seconds():+.3f}s\n\n"
-        f"📝 TRANSCRIPTION\n{transcript or '[No speech detected]'}"
-        f"{word_line}\n\n"
-        f"📎 Audio: {audio_path.name}\n"
-        f"🗂 Timestamp metadata: {metadata_path.name}\n"
-        "ℹ️ Recording timestamps are server capture times; stream buffering may mean the presenter spoke earlier."
-    )
-    telegram_window_result(message, audio_path)
-    log("Saved metadata:", metadata_path)
+    outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / f"menta_{sid}.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2))
+    head = f"🎯 Best word: {word}" if word else "⚠️ No word extracted"
+    tg(f"{head}\n🎙 {slot:%H:%M} slot | recorded {actual_start:%H:%M:%S}-{actual_end:%H:%M:%S} "
+       f"(start offset {start_offset:+.0f}s)\n\n📝 Transcript (overlapping windows):\n{transcript or '[no speech]'}")
 
 
 def cmd_test():

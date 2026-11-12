@@ -1,11 +1,9 @@
 name: Menta 88 - announcement recording
 
+# Triggered at exact times by cron-job.org (POST .../dispatches), ~10 min before each slot.
+# GitHub's own cron is too unreliable for this, so there is no schedule: block.
 on:
   workflow_dispatch:
-  schedule:
-    # Check hourly; Python proceeds only when an announcement is within 15 minutes.
-    # GitHub Actions cron uses UTC. Python handles Europe/Athens and DST.
-    - cron: '50 4-18 * * *'
 
 permissions:
   contents: read
@@ -17,7 +15,7 @@ concurrency:
 jobs:
   record:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -36,15 +34,24 @@ jobs:
       - name: Install Python dependencies
         run: python -m pip install -r requirements.txt
 
-      - name: Record, transcribe, and notify
+      - name: Cache Whisper model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-small
+
+      - name: Listen, transcribe, notify
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           WHISPER_MODEL: small
           WINDOW_LOOKAHEAD_MINUTES: '15'
+          WINDOW_BEFORE_SECONDS: '60'
+          WINDOW_AFTER_SECONDS: '300'
+          CHUNK_SECONDS: '10'
         run: python src/menta.py window
 
-      - name: Upload MP3 and timestamp metadata
+      - name: Upload MP3 chunks and timestamp metadata
         if: always()
         uses: actions/upload-artifact@v4
         with:
