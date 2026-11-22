@@ -1,9 +1,18 @@
 name: Menta 88 - announcement recording
 
 # Triggered at exact times by cron-job.org (POST .../dispatches), ~10 min before each slot.
-# GitHub's own cron is too unreliable for this, so there is no schedule: block.
+# Manual runs: choose mode "window" (real slot, only within 15 min of one) or
+# "replytest" (works any time: tests "reply with a word -> form" without recording).
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "window = listen for the announcement, replytest = test reply->form any time"
+        type: choice
+        default: window
+        options:
+          - window
+          - replytest
 
 permissions:
   contents: read
@@ -34,28 +43,48 @@ jobs:
       - name: Install Python dependencies
         run: python -m pip install -r requirements.txt
 
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-v1
+
+      - name: Install Chromium for form screenshots
+        run: python -m playwright install --with-deps chromium
+
       - name: Cache Whisper model
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
           key: whisper-small
 
-      - name: Listen, transcribe, notify
+      - name: Run
         env:
+          # Nothing is really submitted until you create the repo VARIABLE DRY_RUN = false
+          DRY_RUN: ${{ vars.DRY_RUN || 'true' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EMAIL: ${{ secrets.EMAIL }}
+          SURNAME: ${{ secrets.SURNAME }}
+          FIRST_NAME: ${{ secrets.FIRST_NAME }}
+          GENDER: ${{ secrets.GENDER }}
+          AGE: ${{ secrets.AGE }}
+          PHONE: ${{ secrets.PHONE }}
+          AREA: ${{ secrets.AREA }}
           WHISPER_MODEL: small
           WINDOW_LOOKAHEAD_MINUTES: '15'
           WINDOW_BEFORE_SECONDS: '60'
           WINDOW_AFTER_SECONDS: '300'
+          REPLY_GRACE_SECONDS: '180'
           CHUNK_SECONDS: '10'
-        run: python src/menta.py window
+          SEND_ALL_WINDOWS: 'false'   # 'true' = send every 20s clip + transcript (noisy, good for first tests)
+        run: python src/menta.py ${{ inputs.mode || 'window' }}
 
-      - name: Upload MP3 chunks and timestamp metadata
+      - name: Upload MP3 chunks, metadata and form responses
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: menta-recordings-${{ github.run_id }}
           path: recordings/
           retention-days: 14
-          if-no-files-found: warn
+          if-no-files-found: ignore
